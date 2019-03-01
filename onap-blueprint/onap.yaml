@@ -1,0 +1,148 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+description: >
+  Creates a minimal ONAP environment on Kubernetes
+
+imports:
+  - http://www.getcloudify.org/spec/cloudify/4.5/types.yaml
+  - plugin:cloudify-utilities-plugin
+  - plugin:cloudify-fabric-plugin
+
+inputs:
+
+  k8s_archive:
+    default: ''
+  
+  # OPENSTACK INPUTS
+  keystone_username:
+    type: string
+  keystone_password:
+    type: string
+    default: { get_secret: keystone_password }
+  keystone_tenant_name:
+    type: string
+  keystone_auth_url:
+    type: string
+  keystone_region: 
+    type: string
+
+  # NETWORK INPUTS
+  manager_network:
+    default: external 
+
+  external_network_name:
+    default: external
+
+  external_subnet_name:
+    default: external_subnet
+
+  # COMPUTE INPUTS
+  k8s_image: 
+    description: Ubuntu 16.04 image id
+    default: 1d6340df-2f14-41e6-ab27-bbd35e818fdf
+    
+  k8s_flavor:
+    description: 8GB+ 
+    default: e3cdac85-a546-495a-b7e8-76750fe1a84c
+
+  key_name:
+    default: dfilppi-rs
+  
+  agent_user:
+    default: ubuntu
+ 
+  agent_key_private:
+    default: { get_secret: agent_key_private }
+
+  agent_key_public:
+    default: { get_secret: agent_key_public }
+
+dsl_definitions:
+  fabric_env: &fabric_env
+    host_string: { get_attribute: [ k8s_master, deployment, outputs, master_ip ]}
+    user: { get_input: agent_user }
+    key: { get_secret: agent_key_private } 
+
+node_templates:
+
+  k8s_master:
+    type: cloudify.nodes.DeploymentProxy
+    properties:
+      resource_config:
+        blueprint: 
+          external_resource: true
+          id: k8s
+          blueprint_archive: { get_input: k8s_archive }
+          main_file_name: k8s.yaml
+        deployment:
+          external_resource: true
+          id: k8s
+          inputs:
+            keystone_username: { get_input: keystone_username }
+            keystone_auth_url: { get_input: keystone_auth_url }
+            keystone_region:  { get_input: keystone_region }
+            manager_network: { get_input: manager_network }
+            external_network_name: { get_input: external_network_name }
+            external_subnet_name: { get_input: external_subnet_name }
+            k8s_image:  { get_input: k8s_image }
+            k8s_flavor: { get_input:  k8s_flavor }
+            key_name: { get_input:  key_name }
+            agent_user: { get_input: agent_user }
+            agent_key_private: { get_input: agent_key_private }
+            agent_key_public: { get_input: agent_key_public }
+          outputs:
+            master_ip: master_ip
+
+  nodeprep:
+    type: cloudify.nodes.Root
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: fabric.fabric_plugin.tasks.run_script
+          inputs:
+            script_path: scripts/get_charts.sh
+            fabric_env: *fabric_env
+            process:
+              command_prefix: bash
+        configure:
+          implementation: fabric.fabric_plugin.tasks.run_script
+          inputs:
+            script_path: scripts/prepull.py
+            fabric_env: *fabric_env
+            process:
+              command_prefix: python
+              env:
+                KEY: {concat: ['"', { get_input: agent_key_private },'"']}
+    relationships:
+      - type: cloudify.relationships.depends_on
+        target: k8s_master
+
+  onap:
+    type: cloudify.nodes.Root
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        configure:
+          implementation: fabric.fabric_plugin.tasks.run_script
+          inputs:
+            script_path: scripts/asroot.sh
+            fabric_env: *fabric_env
+            process:
+              command_prefix: bash
+              env:
+                SCRIPT: onap_build.sh
+        start:
+          implementation: fabric.fabric_plugin.tasks.run_script
+          inputs:
+            script_path: scripts/onap_start.sh
+            fabric_env: *fabric_env
+        stop: {}
+    relationships:
+      - type: cloudify.relationships.depends_on
+        target: k8s_master
+      - type: cloudify.relationships.depends_on
+        target: nodeprep
+
+outputs:
+  portal_ip:
+    description: the IP of the ONAP portal
+    value: { get_attribute: [ onap, portal_url ] }

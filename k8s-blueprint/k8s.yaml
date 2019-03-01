@@ -1,0 +1,288 @@
+tosca_definitions_version: cloudify_dsl_1_3
+
+description: >
+  Creates a minimal ONAP environment on Kubernetes
+
+imports:
+  - http://www.getcloudify.org/spec/cloudify/4.5/types.yaml
+  - plugin:cloudify-openstack-plugin
+  - plugin:cloudify-utilities-plugin
+
+inputs:
+  # OPENSTACK INPUTS
+  keystone_username:
+    type: string
+  keystone_password:
+    type: string
+    default: { get_secret: keystone_password }
+  keystone_tenant_name:
+    type: string
+  keystone_auth_url:
+    type: string
+  keystone_region: 
+    type: string
+
+  # NETWORK INPUTS
+  manager_network:
+    default: external 
+
+  external_network_name:
+    default: external
+
+  external_subnet_name:
+    default: external_subnet
+
+  # COMPUTE INPUTS
+  k8s_image: 
+    description: Ubuntu 16.04 image id
+    default: 1d6340df-2f14-41e6-ab27-bbd35e818fdf
+    
+  k8s_flavor:
+    description: 8GB+ 
+    default: e3cdac85-a546-495a-b7e8-76750fe1a84c
+
+  key_name:
+    default: dfilppi-rs
+  
+  agent_user:
+    default: ubuntu
+ 
+  agent_key_private:
+    default: { get_secret: agent_key_private }
+
+  agent_key_public:
+    default: { get_secret: agent_key_public }
+
+dsl_definitions:
+  openstack_config: &openstack_config
+    username: { get_input: keystone_username }
+    password: { get_input: keystone_password }
+    tenant_name: { get_input: keystone_tenant_name }
+    auth_url: { get_input: keystone_auth_url }
+    region: { get_input: keystone_region }
+
+node_templates:
+
+  ############################
+  ## NETWORK
+  ############################
+  external_network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: { get_input: external_network_name }
+
+  external_subnet:
+    type: cloudify.openstack.nodes.Subnet
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: { get_input: external_subnet_name }
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: external_network
+
+  node_network:
+    type: cloudify.openstack.nodes.Network
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: { get_input: external_network_name }
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: node_scaling_group
+
+  node_subnet:
+    type: cloudify.openstack.nodes.Subnet
+    properties:
+      openstack_config: *openstack_config
+      use_external_resource: true
+      resource_id: { get_input: external_subnet_name }
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: external_network
+
+  master_port:
+    type: cloudify.openstack.nodes.Port
+    properties:
+      openstack_config: *openstack_config
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: external_network
+    - type: cloudify.relationships.depends_on
+      target: external_subnet
+    - type: cloudify.openstack.port_connected_to_security_group
+      target: kubernetes_security_group
+
+  node_port:
+    type: cloudify.openstack.nodes.Port
+    properties:
+      openstack_config: *openstack_config
+    relationships:
+    - type: cloudify.relationships.contained_in
+      target: node_network
+    - type: cloudify.relationships.depends_on
+      target: node_subnet
+    - type: cloudify.openstack.port_connected_to_security_group
+      target: kubernetes_security_group
+
+  #open for now
+  kubernetes_security_group:
+    type: cloudify.openstack.nodes.SecurityGroup
+    properties:
+      openstack_config: *openstack_config
+      security_group:
+        name: kubernetes_security_group
+        description: kubernetes master security group
+      rules:
+      - remote_ip_prefix: 0.0.0.0/0
+        port_range_min: 1
+        port_range_max: 65535
+      - remote_ip_prefix: 0.0.0.0/0
+        port_range_min: 1
+        port_range_max: 65535
+        protocol: udp
+
+  ############################
+  ## COMPUTE
+  ############################
+  k8s_host_cloud_config:
+    type: cloudify.nodes.CloudInit.CloudConfig
+    properties:
+      resource_config:
+        apt:
+          sources:
+            kubernetes.list:
+              source: deb https://apt.kubernetes.io/ kubernetes-xenial main
+        packages:
+        - python
+        - apt-transport-https
+        - ca-certificates 
+        - curl
+        - make
+        - gnupg-agent
+        - software-properties-common
+        users:
+        - name: { get_input: agent_user }
+          groups: sudo
+          shell: /bin/bash
+          sudo: ['ALL=(ALL) NOPASSWD:ALL']
+          ssh-authorized-keys:
+          - { get_input: agent_key_public }
+        runcmd:
+        - [ sh, -c, "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -" ]
+        - [ sh, -c, "apt-add-repository \"deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable\"" ]
+        - [ sh, -c, "apt-get update" ]
+        - [ sh, -c, "curl -fsSL https://get.docker.com -o /get-docker.sh && chmod +x /get-docker.sh" ]
+        - [ sh, -c, "VERSION=17.03.3 /get-docker.sh" ]
+        - [ sh, -c, "sysctl net.bridge.bridge-nf-call-iptables=1" ]
+        - [ sh, -c, "curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -" ]
+        #- [ sh, -c, "apt-get install -y --allow-unauthenticated kubernetes-cni=0.5.1-00 kubelet=1.8.10-00 kubeadm=1.8.10-00 kubectl=1.8.10-00" ]
+        - [ sh, -c, "apt-get install -y --allow-unauthenticated kubelet kubeadm kubectl" ]
+        - [ sh, -c, "apt-mark hold kubelet kubeadm kubectl" ]
+
+  k8s_master_vm:
+    type: cloudify.openstack.nodes.Server
+    properties:
+      openstack_config: *openstack_config
+      agent_config:
+        network: { get_input: manager_network }
+        install_method: init_script
+        user: { get_input: agent_user }
+        port: 22
+        key: { get_input: agent_key_private }
+      server:
+        key_name: ''
+        image: ''
+        flavor: ''
+      management_network_name: ''
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: openstack.nova_plugin.server.create
+          inputs: 
+            args:
+              image: { get_input: k8s_image }
+              flavor: { get_input: k8s_flavor }
+              userdata: { get_attribute: [ k8s_host_cloud_config, cloud_config ] }
+    relationships:
+      - type: cloudify.openstack.server_connected_to_port
+        target: master_port
+      - type: cloudify.relationships.connected_to
+        target: k8s_host_cloud_config
+
+  k8s_master:
+    type: cloudify.nodes.Root
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: scripts/init_master.sh 
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: k8s_master_vm
+
+  k8s_node_vm:
+    type: cloudify.openstack.nodes.Server
+    properties:
+      openstack_config: *openstack_config
+      agent_config:
+        network: { get_input: manager_network }
+        install_method: init_script
+        user: { get_input: agent_user }
+        port: 22
+        key: { get_input: agent_key_private }
+      server:
+        key_name: ''
+        image: ''
+        flavor: ''
+      management_network_name: ''
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: openstack.nova_plugin.server.create
+          inputs: 
+            args:
+              image: { get_input: k8s_image }
+              flavor: { get_input: k8s_flavor }
+              userdata: { get_attribute: [ k8s_host_cloud_config, cloud_config ] }
+    relationships:
+      - type: cloudify.relationships.depends_on
+        target: k8s_master
+      - type: cloudify.openstack.server_connected_to_port
+        target: node_port
+      - type: cloudify.relationships.connected_to
+        target: k8s_host_cloud_config
+      - type: cloudify.relationships.contained_in
+        target: node_scaling_group
+
+  k8s_node:
+    type: cloudify.nodes.Root
+    interfaces:
+      cloudify.interfaces.lifecycle:
+        create:
+          implementation: scripts/init_node.sh 
+          inputs:
+            JOIN: { get_attribute: [ k8s_master, join_cmd ] }
+    relationships:
+      - type: cloudify.relationships.contained_in
+        target: k8s_node_vm
+
+  node_scaling_group:
+    type: cloudify.nodes.Root
+
+groups:
+  node_group:
+    members: [ k8s_node, node_port, node_scaling_group ]
+
+policies:
+  node_scale_policy:
+    type: cloudify.policies.scaling
+    properties:
+      default_instances: 5
+    targets: [ node_group ]
+
+outputs:
+  master_ip:
+    description: the IP of the K8S master
+    value: { get_attribute: [ k8s_master_vm, ip ] }

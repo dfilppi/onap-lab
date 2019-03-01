@@ -1,0 +1,5 @@
+keystone_username:
+keystone_password:
+keystone_tenant_name:
+keystone_auth_url:
+keystone_region:
